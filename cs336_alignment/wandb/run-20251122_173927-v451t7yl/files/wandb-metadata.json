@@ -1,0 +1,42 @@
+{
+  "os": "Linux-6.8.0-87-generic-x86_64-with-glibc2.35",
+  "python": "CPython 3.12.12",
+  "startedAt": "2025-11-23T01:39:28.547044Z",
+  "program": "/home/chengze/work/assignment5-alignment/cs336_alignment/vllm.ipynb",
+  "codePath": "cs336_alignment/vllm.ipynb",
+  "git": {
+    "remote": "https://github.com/zx3xyy/assignment5-alignment",
+    "commit": "eb2c562e05802d3c9ee4c4ec2eec43b104d77e9e"
+  },
+  "email": "fancz2002@gmail.com",
+  "root": "/home/chengze/work/assignment5-alignment/cs336_alignment",
+  "host": "chengze-X570S-AORUS-MASTER",
+  "executable": "/home/chengze/work/assignment5-alignment/.venv/bin/python",
+  "codePathLocal": "vllm.ipynb",
+  "cpu_count": 12,
+  "cpu_count_logical": 24,
+  "gpu": "NVIDIA GeForce RTX 4080 SUPER",
+  "gpu_count": 1,
+  "disk": {
+    "/": {
+      "total": "2014574526464",
+      "used": "123950292992"
+    }
+  },
+  "memory": {
+    "total": "67352760320"
+  },
+  "cpu": {
+    "count": 12,
+    "countLogical": 24
+  },
+  "gpu_nvidia": [
+    {
+      "name": "NVIDIA GeForce RTX 4080 SUPER",
+      "memoryTotal": "17171480576",
+      "cudaCores": 10240,
+      "architecture": "Ada"
+    }
+  ],
+  "cudaVersion": "13.0"
+}
