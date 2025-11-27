@@ -23,6 +23,8 @@ dependencies = [
     "datasets>=2.14.4",
     "black>=25.11.0",
     "matplotlib>=3.10.7",
+    "setuptools>=80.4.0",
+    "tyro>=0.9.35",
 ]
 
 [tool.setuptools.packages.find]
