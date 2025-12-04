@@ -107,7 +107,7 @@ def evaluate_vllm(
     return res
 
 
-def run_eval(eval_model, eval_loader):
+def run_eval(cfg, eval_model, eval_loader):
     examples = next(iter(eval_loader))
     prompts = [
         cfg.prompt_template.format(question=problem) for problem in examples["problem"]
@@ -230,7 +230,7 @@ def train(cfg, model, tokenizer, optimizer, eval_model, train_loader, eval_loade
                 # if idx % cfg.eval_gap == 0:
                 global_eval_step += 1
                 load_policy_into_vllm_instance(model, eval_model)
-                eval_res = run_eval(eval_model, eval_loader)
+                eval_res = run_eval(cfg, eval_model, eval_loader)
                 avg_format_reward = np.mean(
                     [x["score"]["format_reward"] for x in eval_res]
                 )
