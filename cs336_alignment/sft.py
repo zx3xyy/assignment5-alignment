@@ -1,8 +1,9 @@
-from vllm.model_executor import set_random_seed as vllm_set_random_seed
 from unittest.mock import patch
-from vllm import LLM, SamplingParams
+
 import torch
 from transformers import PreTrainedModel
+from vllm import LLM, SamplingParams
+from vllm.model_executor import set_random_seed as vllm_set_random_seed
 
 
 def tokenize_prompt_and_output(
@@ -11,7 +12,7 @@ def tokenize_prompt_and_output(
     tokenizer,
     device: str | None = None,
 ):
-    prompt_strs = prompt_strs
+    # Build concatenated prompt/response tensors for teacher-forced decoding.
     B = len(prompt_strs)
     promopt_ids = tokenizer(prompt_strs)["input_ids"]
     out_ids = tokenizer(output_strs)["input_ids"]
@@ -41,8 +42,8 @@ def compute_entropy(logits: torch.Tensor) -> torch.Tensor:
     # logits: batch_size, sequence_length, vocab_size
     log_probs = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
     probs = torch.exp(log_probs)
-    entroy = -torch.sum(probs * log_probs, dim=-1)
-    return entroy
+    entropy = -torch.sum(probs * log_probs, dim=-1)
+    return entropy
 
 
 def get_response_log_probs(
@@ -51,6 +52,7 @@ def get_response_log_probs(
     labels: torch.Tensor,
     return_token_entropy: bool = False,
 ) -> dict[str, torch.Tensor]:
+    # Compute token-level log probs (and optionally entropy) for provided labels.
     logits = model(input_ids).logits
     log_probs = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
     res = {}

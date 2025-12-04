@@ -1,7 +1,7 @@
 from typing import Callable, Literal
+
 import torch
 import torch.nn.functional as F
-from einops import repeat
 from transformers import AutoModelForCausalLM
 
 
@@ -211,11 +211,13 @@ def compute_log_probs(
 
         return per_token_log_probs
 
+    # Fast path when batch is small or memory is ample.
     if not mem_optimize or input_ids.shape[0] <= chunk_size:
         return _compute_chunk(input_ids, labels)
 
     log_probs_list = []
     total_samples = input_ids.shape[0]
+    # Chunk to reduce peak memory while keeping outputs contiguous.
     for i in range(0, total_samples, chunk_size):
         end_idx = min(i + chunk_size, total_samples)
         chunk_input = input_ids[i:end_idx]

@@ -1,4 +1,5 @@
-# run_experiments.py
+"""Batch launcher for expert-iteration sweeps."""
+
 import subprocess
 from typing import Dict, List
 
@@ -25,6 +26,7 @@ EXPERIMENTS: List[Dict[str, int]] = [
 
 
 def run_experiment(index: int, exp: Dict[str, int]) -> int:
+    """Execute a single expert_iteration.py run with provided hyperparams."""
     print(
         f"\n=== Running exp {index + 1} / {len(EXPERIMENTS)}: "
         f"G={exp['G']}, n_epochs={exp['n_epochs']}, D_B={exp['D_B']} ==="

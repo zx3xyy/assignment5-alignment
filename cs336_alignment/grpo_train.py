@@ -1,45 +1,53 @@
 from dataclasses import dataclass
 from typing import Literal
+
+import numpy as np
 import torch
-from expert_iteration import init_policy_model, init_vllm
-from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel
-from vllm import LLM, SamplingParams
-from cs336_alignment.grpo import compute_log_probs
-from cs336_alignment.sft import tokenize_prompt_and_output
+import wandb
+from datasets import load_dataset
+from transformers import AutoTokenizer
+from vllm import SamplingParams
+
+from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
+from cs336_alignment.expert_iteration import load_policy_into_vllm_instance, run_eval
 from cs336_alignment.grpo import (
     compute_group_normalized_rewards,
+    compute_log_probs,
     grpo_microbatch_train_step,
 )
-from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
-from datasets import load_dataset
-from cs336_alignment.expert_iteration import load_policy_into_vllm_instance, run_eval
-import wandb
-import numpy as np
+from cs336_alignment.sft import tokenize_prompt_and_output
+from expert_iteration import init_policy_model, init_vllm
 
 
 @dataclass
 class Config:
+    # Optimization / GRPO hyperparameters
     n_grpo_steps: int = 200
     learning_rate: float = 1e-5
-    advantage_eps: float = 1e-6
-    rollout_batch_size: int = 256
-    group_size: int = 8
-    sampling_temperature: float = 1.0
-    sampling_min_tokens: int = 4  # As in Expiter, disallow empty string responses
-    sampling_max_tokens: int = 1024
-    epochs_per_rollout_batch: int = 1  # On-policy
-    train_batch_size: int = 256  # On-policy
     gradient_accumulation_steps: int = 32  # microbatch size is 2, will fit on H100
-    gpu_memory_utilization: float = 0.09
     loss_type: Literal[
         "no_baseline",
         "reinforce_with_baseline",
         "grpo_clip",
     ] = "reinforce_with_baseline"
+    advantage_eps: float = 1e-6
+    rollout_batch_size: int = 256
+    epochs_per_rollout_batch: int = 1  # On-policy
+    train_batch_size: int = 256  # On-policy
+
+    # Sampling / reward shaping
+    group_size: int = 8
+    sampling_temperature: float = 1.0
+    sampling_min_tokens: int = 4  # As in Expiter, disallow empty string responses
+    sampling_max_tokens: int = 1024
     use_std_normalization: bool = True
 
+    # Model / system configs
     model_id: str = "Qwen/Qwen2.5-Math-1.5B"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    gpu_memory_utilization: float = 0.09
+
+    # Data + eval
     train_data: str = "results/math_1.5B_train.jsonl"
     eval_data: str = "jeggers/competition_math"
     prompt_template: str = ""
@@ -64,7 +72,7 @@ def main():
     cfg = Config()
     global_train_step = 0
     global_eval_step = 0
-    wandb.init(project="math-sft", config=cfg)
+    wandb.init(project="math-sft", config=cfg)  # Track config and metrics
     wandb.define_metric("train_step")
     wandb.define_metric("eval_step")
     wandb.define_metric("train/*", step_metric="train_step")
@@ -73,6 +81,7 @@ def main():
     with open("cs336_alignment/prompts/r1_zero.prompt") as f:
         cfg.prompt_template = f.read()
 
+    # Evaluation dataloader uses the held-out split
     eval_dataset = load_dataset("jeggers/competition_math", "original", split="test")
     eval_loader = torch.utils.data.DataLoader(
         eval_dataset,
@@ -113,6 +122,7 @@ def main():
     )
     data_iter = iter(rollout_loader)
 
+    # Main GRPO training loop
     for grpo_step in range(cfg.n_grpo_steps):
         load_policy_into_vllm_instance(policy, eval_model)
         examples = next(data_iter)
