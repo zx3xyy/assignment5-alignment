@@ -21,6 +21,7 @@ from expert_iteration import init_policy_model, init_vllm
 
 @dataclass
 class Config:
+    enable_wandb: bool = True
     # Optimization / GRPO hyperparameters
     n_grpo_steps: int = 200
     learning_rate: float = 1e-5
@@ -46,9 +47,14 @@ class Config:
     model_id: str = "Qwen/Qwen2.5-Math-1.5B"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     gpu_memory_utilization: float = 0.09
+    use_eager_vllm: bool = (
+        False  # When True, skips CUDA graph capture to speed debugging
+    )
+    reset_vllm_cache_each_step: bool = True  # Optional: clear KV cache to limit growth
+    empty_cuda_cache: bool = True  # Optional: call torch.cuda.empty_cache() each step
 
     # Data + eval
-    train_data: str = "results/math_1.5B_train.jsonl"
+    train_data: str = "cs336_alignment/results/math_1.5B_train.jsonl"
     eval_data: str = "jeggers/competition_math"
     prompt_template: str = ""
     eval_reader_local_batch_size: int = 32
@@ -68,48 +74,33 @@ class Config:
         self.n_prompts_per_rollout_batch = self.rollout_batch_size // self.group_size
 
 
-def main():
-    cfg = Config()
-    global_train_step = 0
-    global_eval_step = 0
-    wandb.init(project="math-sft", config=cfg)  # Track config and metrics
-    wandb.define_metric("train_step")
-    wandb.define_metric("eval_step")
-    wandb.define_metric("train/*", step_metric="train_step")
-    wandb.define_metric("eval/*", step_metric="eval_step")
+def init_wandb(cfg: Config):
+    wandb_log = lambda *_args, **_kwargs: None
+    if cfg.enable_wandb:
+        wandb.init(project="math-sft", config=cfg)
+        wandb.define_metric("train_step")
+        wandb.define_metric("eval_step")
+        wandb.define_metric("train/*", step_metric="train_step")
+        wandb.define_metric("eval/*", step_metric="eval_step")
+        wandb_log = wandb.log
+    return wandb_log
 
+
+def load_prompt_template(cfg: Config):
     with open("cs336_alignment/prompts/r1_zero.prompt") as f:
         cfg.prompt_template = f.read()
 
-    # Evaluation dataloader uses the held-out split
-    eval_dataset = load_dataset("jeggers/competition_math", "original", split="test")
-    eval_loader = torch.utils.data.DataLoader(
-        eval_dataset,
-        batch_size=cfg.eval_reader_local_batch_size,
-        shuffle=True,
-    )
-    policy = init_policy_model(cfg.model_id, cfg.device)
-    eval_model = init_vllm(
-        cfg.model_id,
-        cfg.device,
-        seed=42,
-        gpu_memory_utilization=cfg.gpu_memory_utilization,
-    )
-    tokenizer = AutoTokenizer.from_pretrained(cfg.model_id)
-    optimizer = torch.optim.AdamW(
-        policy.parameters(),
-        lr=cfg.learning_rate,
-        weight_decay=0.0,
-        betas=(0.9, 0.95),
-    )
 
+def build_rollout(cfg: Config):
+    # rollout_dataset = load_dataset("json", data_files=cfg.train_data, split="train")
     rollout_dataset = load_dataset(cfg.eval_data, "original", split="train")
+
     rollout_loader = torch.utils.data.DataLoader(
         rollout_dataset,
         batch_size=cfg.n_prompts_per_rollout_batch,
         shuffle=True,
-        num_workers=4,
-        pin_memory=True,
+        num_workers=0,
+        pin_memory=False,
     )
     rollout_sampling_params: SamplingParams = SamplingParams(
         temperature=cfg.sampling_temperature,
@@ -120,12 +111,60 @@ def main():
         include_stop_str_in_output=True,
         n=cfg.group_size,
     )
+    return rollout_dataset, rollout_loader, rollout_sampling_params
+
+
+def build_eval_loader(cfg: Config, rollout_dataset):
+    eval_dataset = load_dataset(cfg.eval_data, "original", split="test")
+    return torch.utils.data.DataLoader(
+        eval_dataset,
+        batch_size=cfg.eval_reader_local_batch_size,
+        shuffle=True,
+    )
+
+
+def init_models_and_optimizer(cfg: Config):
+    policy = init_policy_model(cfg.model_id, cfg.device)
+    eval_model = init_vllm(
+        cfg.model_id,
+        cfg.device,
+        seed=42,
+        gpu_memory_utilization=cfg.gpu_memory_utilization,
+        enforce_eager=cfg.use_eager_vllm,
+    )
+    tokenizer = AutoTokenizer.from_pretrained(cfg.model_id)
+    optimizer = torch.optim.AdamW(
+        policy.parameters(),
+        lr=cfg.learning_rate,
+        weight_decay=0.0,
+        betas=(0.9, 0.95),
+        eps=1e-8,
+        fused=True,
+    )
+    return policy, eval_model, tokenizer, optimizer
+
+
+def train(cfg: Config):
+    global_train_step = 0
+    global_eval_step = 0
+    print(f"[config] device={cfg.device}, model={cfg.model_id}")
+    print(
+        f"[config] wandb={'on' if cfg.enable_wandb else 'off'}, "
+        f"eager_vllm={'on' if cfg.use_eager_vllm else 'off'}"
+    )
+
+    wandb_log = init_wandb(cfg)
+    load_prompt_template(cfg)
+    rollout_dataset, rollout_loader, rollout_sampling_params = build_rollout(cfg)
+    eval_loader = build_eval_loader(cfg, rollout_dataset)
+    policy, eval_model, tokenizer, optimizer = init_models_and_optimizer(cfg)
+
     data_iter = iter(rollout_loader)
 
-    # Main GRPO training loop
     for grpo_step in range(cfg.n_grpo_steps):
         load_policy_into_vllm_instance(policy, eval_model)
         examples = next(data_iter)
+
         prompts = [
             cfg.prompt_template.format(question=problem)
             for problem in examples["problem"]
@@ -147,7 +186,9 @@ def main():
         responses = tokenized_dict["labels"].to(cfg.device)
         response_mask = tokenized_dict["response_mask"].to(cfg.device)
         with torch.no_grad():
-            old_log_probs = compute_log_probs(prompts, responses, policy, True)
+            old_log_probs = compute_log_probs(
+                prompts, responses, policy, mem_optimize=True, chunk_size=32
+            )
             advantages, raw_rewards, _ = compute_group_normalized_rewards(
                 reward_fn=r1_zero_reward_fn,
                 rollout_responses=flat_response_sts,
@@ -158,6 +199,10 @@ def main():
             )
             advantages = advantages.unsqueeze(-1).to(cfg.device)
             raw_rewards = raw_rewards.unsqueeze(-1).to(cfg.device)
+            raw_rewards_mean = raw_rewards.mean().item()
+            raw_rewards_std = raw_rewards.std().item()
+            advantages_mean = advantages.mean().item()
+            advantages_std = advantages.std().item()
 
         for epoch in range(cfg.epochs_per_rollout_batch):
             for mb_step, mini_batch_start_idx in enumerate(
@@ -192,12 +237,16 @@ def main():
                     optimizer.step()
                     optimizer.zero_grad()
                     global_train_step += 1
-                    wandb.log(
+                    wandb_log(
                         {
                             "train_step": global_train_step,
                             "train/loss": loss.item() * cfg.gradient_accumulation_steps,
                             "train/grad_norm": grad_norm.item(),
                             "train/lr": optimizer.param_groups[0]["lr"],
+                            "train/reward_mean": raw_rewards_mean,
+                            "train/reward_std": raw_rewards_std,
+                            "train/adv_mean": advantages_mean,
+                            "train/adv_std": advantages_std,
                         }
                     )
                     # Eval after each update!
@@ -209,15 +258,43 @@ def main():
                     avg_answer_reward = np.mean(
                         [x["score"]["answer_reward"] for x in eval_res]
                     )
+                    print(
+                        f"[train] step={global_train_step} "
+                        f"loss={loss.item() * cfg.gradient_accumulation_steps:.4f} "
+                        f"grad_norm={grad_norm.item():.2f} "
+                        f"reward_mean={raw_rewards_mean:.4f} "
+                        f"adv_mean={advantages_mean:.4f} "
+                        f"eval_format={avg_format_reward:.3f} "
+                        f"eval_answer={avg_answer_reward:.3f}"
+                    )
                     global_eval_step += 1
-                    wandb.log(
+                    wandb_log(
                         {
                             "eval_step": global_eval_step,
                             "eval/format_reward": avg_format_reward,
                             "eval/answer_reward": avg_answer_reward,
                         }
                     )
+        if cfg.reset_vllm_cache_each_step and hasattr(eval_model, "llm_engine"):
+            try:
+                eval_model.llm_engine.cache_engine.reset()
+            except Exception as exc:  # noqa: BLE001
+                print(f"[warn] failed to reset vLLM cache: {exc}")
+
+        if cfg.empty_cuda_cache and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        del (
+            prompts,
+            responses,
+            response_mask,
+            raw_rewards,
+            advantages,
+            old_log_probs,
+            flat_response_sts,
+            tokenized_dict,
+        )
 
 
 if __name__ == "__main__":
-    main()
+    train(Config())

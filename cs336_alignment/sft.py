@@ -93,7 +93,11 @@ def sft_microbatch_train_step(
 
 
 def init_vllm(
-    model_id: str, device: str, seed: int, gpu_memory_utilization: float = 0.85
+    model_id: str,
+    device: str,
+    seed: int,
+    gpu_memory_utilization: float = 0.85,
+    enforce_eager: bool = False,
 ):
     """
     Start the inference process, here we use vLLM to hold a model on a GPU separate from the policy.
@@ -112,4 +116,5 @@ def init_vllm(
             dtype=torch.bfloat16,
             enable_prefix_caching=True,
             gpu_memory_utilization=gpu_memory_utilization,
+            enforce_eager=enforce_eager,
         )
