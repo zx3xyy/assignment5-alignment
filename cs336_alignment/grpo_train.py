@@ -1,12 +1,14 @@
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Tuple
 
 import numpy as np
 import torch
 import wandb
 from datasets import load_dataset
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
-from vllm import SamplingParams
+from vllm import LLM, SamplingParams
 
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
 from cs336_alignment.expert_iteration import load_policy_into_vllm_instance, run_eval
@@ -91,7 +93,7 @@ def load_prompt_template(cfg: Config):
         cfg.prompt_template = f.read()
 
 
-def build_rollout(cfg: Config):
+def build_rollout(cfg: Config) -> Tuple[DataLoader, SamplingParams]:
     # rollout_dataset = load_dataset("json", data_files=cfg.train_data, split="train")
     rollout_dataset = load_dataset(cfg.eval_data, "original", split="train")
 
@@ -111,19 +113,21 @@ def build_rollout(cfg: Config):
         include_stop_str_in_output=True,
         n=cfg.group_size,
     )
-    return rollout_dataset, rollout_loader, rollout_sampling_params
+    return rollout_loader, rollout_sampling_params
 
 
-def build_eval_loader(cfg: Config, rollout_dataset):
+def build_eval_loader(cfg: Config) -> DataLoader:
     eval_dataset = load_dataset(cfg.eval_data, "original", split="test")
     return torch.utils.data.DataLoader(
         eval_dataset,
         batch_size=cfg.eval_reader_local_batch_size,
-        shuffle=True,
+        shuffle=False,  # Consistent eval across steps
     )
 
 
-def init_models_and_optimizer(cfg: Config):
+def init_models_and_optimizer(
+    cfg: Config,
+) -> Tuple[torch.nn.Module, LLM, AutoTokenizer, torch.optim.AdamW, CosineAnnealingLR]:
     policy = init_policy_model(cfg.model_id, cfg.device)
     eval_model = init_vllm(
         cfg.model_id,
@@ -141,7 +145,10 @@ def init_models_and_optimizer(cfg: Config):
         eps=1e-8,
         fused=True,
     )
-    return policy, eval_model, tokenizer, optimizer
+    scheduler = CosineAnnealingLR(
+        optimizer, T_max=cfg.n_grpo_steps, eta_min=cfg.learning_rate * 0.1
+    )
+    return policy, eval_model, tokenizer, optimizer, scheduler
 
 
 def train(cfg: Config):
@@ -155,15 +162,24 @@ def train(cfg: Config):
 
     wandb_log = init_wandb(cfg)
     load_prompt_template(cfg)
-    rollout_dataset, rollout_loader, rollout_sampling_params = build_rollout(cfg)
-    eval_loader = build_eval_loader(cfg, rollout_dataset)
-    policy, eval_model, tokenizer, optimizer = init_models_and_optimizer(cfg)
+    rollout_loader, rollout_sampling_params = build_rollout(cfg)
+    eval_loader = build_eval_loader(cfg)
+    policy, eval_model, tokenizer, optimizer, scheduler = init_models_and_optimizer(cfg)
+
+    # Zero gradients at start
+    optimizer.zero_grad()
 
     data_iter = iter(rollout_loader)
 
     for grpo_step in range(cfg.n_grpo_steps):
         load_policy_into_vllm_instance(policy, eval_model)
-        examples = next(data_iter)
+
+        # Handle data iterator exhaustion
+        try:
+            examples = next(data_iter)
+        except StopIteration:
+            data_iter = iter(rollout_loader)
+            examples = next(data_iter)
 
         prompts = [
             cfg.prompt_template.format(question=problem)
@@ -189,13 +205,13 @@ def train(cfg: Config):
             old_log_probs = compute_log_probs(
                 prompts, responses, policy, mem_optimize=True, chunk_size=32
             )
-            advantages, raw_rewards, _ = compute_group_normalized_rewards(
+            advantages, raw_rewards, group_rewards = compute_group_normalized_rewards(
                 reward_fn=r1_zero_reward_fn,
                 rollout_responses=flat_response_sts,
                 repeated_ground_truths=repeated_ground_truths,
                 group_size=cfg.group_size,
-                advantage_eps=1e-8,
-                normalize_by_std=False,
+                advantage_eps=cfg.advantage_eps,
+                normalize_by_std=cfg.use_std_normalization,
             )
             advantages = advantages.unsqueeze(-1).to(cfg.device)
             raw_rewards = raw_rewards.unsqueeze(-1).to(cfg.device)
@@ -237,6 +253,9 @@ def train(cfg: Config):
                     optimizer.step()
                     optimizer.zero_grad()
                     global_train_step += 1
+                    # Step the scheduler after optimizer step
+                    scheduler.step()
+
                     wandb_log(
                         {
                             "train_step": global_train_step,
