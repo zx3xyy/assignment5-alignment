@@ -2,8 +2,9 @@ import os
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
+import tyro
 from dataclasses import dataclass, asdict
-from typing import Literal, Tuple
+from typing import Literal, Tuple, Optional
 
 import numpy as np
 import torch
@@ -15,7 +16,11 @@ from transformers import AutoTokenizer, PreTrainedModel
 from vllm import LLM, SamplingParams
 
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
-from cs336_alignment.expert_iteration import load_policy_into_vllm_instance, run_eval
+from cs336_alignment.expert_iteration import (
+    evaluate_vllm,
+    load_policy_into_vllm_instance,
+    run_eval,
+)
 from cs336_alignment.grpo import (
     compute_group_normalized_rewards,
     compute_log_probs,
@@ -73,6 +78,11 @@ class Config:
         stop=["</answer>"],
         include_stop_str_in_output=True,
     )
+
+    # Experiment tracking
+    exp_name: str = "grpo_baseline"
+    wandb_group: Optional[str] = None
+    output_dir: str = "cs336_alignment/results"
 
     def __post_init__(self):
         self.mini_batch_size = (
@@ -226,6 +236,20 @@ def train(cfg: Config):
             advantages_mean = advantages.mean().item()
             advantages_std = advantages.std().item()
 
+        # Log/Print example rollouts every 10 steps
+        if grpo_step % 10 == 0:
+            if cfg.enable_wandb:
+                table_data = []
+                # Log only the first group to avoid excessive data upload
+                for i in range(cfg.group_size):
+                    table_data.append([
+                        flat_prompt_strs[i],
+                        flat_response_sts[i],
+                        repeated_ground_truths[i],
+                        raw_rewards[i].item()
+                    ])
+                wandb_log({"rollout_examples": wandb.Table(columns=["Prompt", "Response", "Ground Truth", "Reward"], data=table_data)})
+
         for epoch in range(cfg.epochs_per_rollout_batch):
             for mb_step, mini_batch_start_idx in enumerate(
                 range(0, cfg.rollout_batch_size, cfg.mini_batch_size)
@@ -300,6 +324,48 @@ def train(cfg: Config):
                             "eval/answer_reward": avg_answer_reward,
                         }
                     )
+
+    # Save model
+    print("Saving final model...")
+    save_path = "cs336_alignment/results/final_model"
+    policy_model.save_pretrained(save_path)
+    tokenizer.save_pretrained(save_path)
+    print(f"Model saved to {save_path}")
+
+    # Full evaluation
+    print("Running full evaluation on test set...")
+    load_policy_into_vllm_instance(policy_model, eval_model)
+    
+    all_eval_res = []
+    # Re-create eval loader to ensure we iterate from start
+    full_eval_loader = build_eval_loader(cfg)
+    
+    from tqdm import tqdm
+    for batch in tqdm(full_eval_loader, desc="Evaluating"):
+        prompts = [
+            cfg.prompt_template.format(question=problem) for problem in batch["problem"]
+        ]
+        extracted_solutions = [solution for solution in batch["extracted_solution"]]
+        
+        batch_res = evaluate_vllm(
+            eval_model, 
+            r1_zero_reward_fn, 
+            prompts, 
+            extracted_solutions, 
+            cfg.sampling_params
+        )
+        all_eval_res.extend(batch_res)
+
+    avg_format_reward = np.mean([x["score"]["format_reward"] for x in all_eval_res])
+    avg_answer_reward = np.mean([x["score"]["answer_reward"] for x in all_eval_res])
+    
+    print(f"[Final Eval] Format Reward: {avg_format_reward:.4f}, Answer Reward: {avg_answer_reward:.4f}")
+    
+    if cfg.enable_wandb:
+        wandb_log({
+            "final_eval/format_reward": avg_format_reward,
+            "final_eval/answer_reward": avg_answer_reward,
+        })
 
 
 if __name__ == "__main__":
