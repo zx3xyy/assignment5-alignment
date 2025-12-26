@@ -44,7 +44,7 @@ class Config:
     train_reader_local_batch_size: int = 4
     eval_reader_local_batch_size: int = 32
 
-    n_epochs: int = 3  # 统一用 n_epochs
+    n_epochs: int = 3
     n_steps_per_epoch: int = 78
     peak_lr: float = 2e-5
     total_steps: int = 1000
@@ -52,7 +52,7 @@ class Config:
 
     expert_iteration: bool = True
     G: int = 4  # rollout per prompt
-    D_B: int = 512  # 统一用 D_B
+    D_B: int = 512 
 
     vllm_gpu_memory_utilization: float = 0.1
     n_ei_steps: int = 5
@@ -147,7 +147,7 @@ def get_train_dataloader(cfg, eval_model):
     rollout_loader = torch.utils.data.DataLoader(
         rollout_dataset,
         batch_size=cfg.D_B,
-        shuffle=True,
+        shuffle=False,
         num_workers=4,
         pin_memory=True,
     )
@@ -178,7 +178,7 @@ def get_train_dataloader(cfg, eval_model):
     train_loader = DataLoader(
         dataset,
         batch_size=cfg.train_reader_local_batch_size,
-        shuffle=True,
+        shuffle=False,
         collate_fn=collate_fn,  # Critical for variable length sequences
     )
     return train_loader

@@ -7,7 +7,7 @@ import wandb
 from datasets import load_dataset
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, PreTrainedModel
 from vllm import LLM, SamplingParams
 
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
@@ -47,7 +47,8 @@ class Config:
 
     # Model / system configs
     model_id: str = "Qwen/Qwen2.5-Math-1.5B"
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    rollout_model_device: str = "cuda:0"
+    policy_model_device: str = "cuda:1"
     gpu_memory_utilization: float = 0.09
     use_eager_vllm: bool = (
         False  # When True, skips CUDA graph capture to speed debugging
@@ -56,8 +57,8 @@ class Config:
     empty_cuda_cache: bool = True  # Optional: call torch.cuda.empty_cache() each step
 
     # Data + eval
-    train_data: str = "cs336_alignment/results/math_1.5B_train.jsonl"
-    eval_data: str = "jeggers/competition_math"
+    # train_data: str = "cs336_alignment/results/math_1.5B_train.jsonl"
+    dataset: str = "jeggers/competition_math"
     prompt_template: str = ""
     eval_reader_local_batch_size: int = 32
     sampling_params = SamplingParams(
@@ -95,7 +96,7 @@ def load_prompt_template(cfg: Config):
 
 def build_rollout(cfg: Config) -> Tuple[DataLoader, SamplingParams]:
     # rollout_dataset = load_dataset("json", data_files=cfg.train_data, split="train")
-    rollout_dataset = load_dataset(cfg.eval_data, "original", split="train")
+    rollout_dataset = load_dataset(cfg.dataset, "original", split="train")
 
     rollout_loader = torch.utils.data.DataLoader(
         rollout_dataset,
@@ -117,7 +118,7 @@ def build_rollout(cfg: Config) -> Tuple[DataLoader, SamplingParams]:
 
 
 def build_eval_loader(cfg: Config) -> DataLoader:
-    eval_dataset = load_dataset(cfg.eval_data, "original", split="test")
+    eval_dataset = load_dataset(cfg.dataset, "original", split="test")
     return torch.utils.data.DataLoader(
         eval_dataset,
         batch_size=cfg.eval_reader_local_batch_size,
@@ -127,18 +128,18 @@ def build_eval_loader(cfg: Config) -> DataLoader:
 
 def init_models_and_optimizer(
     cfg: Config,
-) -> Tuple[torch.nn.Module, LLM, AutoTokenizer, torch.optim.AdamW, CosineAnnealingLR]:
-    policy = init_policy_model(cfg.model_id, cfg.device)
+) -> Tuple[PreTrainedModel, LLM, AutoTokenizer, torch.optim.AdamW, CosineAnnealingLR]:
     eval_model = init_vllm(
         cfg.model_id,
-        cfg.device,
+        cfg.rollout_model_device,
         seed=42,
         gpu_memory_utilization=cfg.gpu_memory_utilization,
         enforce_eager=cfg.use_eager_vllm,
     )
+    policy_model = init_policy_model(cfg.model_id, cfg.policy_model_device)
     tokenizer = AutoTokenizer.from_pretrained(cfg.model_id)
     optimizer = torch.optim.AdamW(
-        policy.parameters(),
+        policy_model.parameters(),
         lr=cfg.learning_rate,
         weight_decay=0.0,
         betas=(0.9, 0.95),
@@ -148,13 +149,13 @@ def init_models_and_optimizer(
     scheduler = CosineAnnealingLR(
         optimizer, T_max=cfg.n_grpo_steps, eta_min=cfg.learning_rate * 0.1
     )
-    return policy, eval_model, tokenizer, optimizer, scheduler
+    return policy_model, eval_model, tokenizer, optimizer, scheduler
 
 
 def train(cfg: Config):
     global_train_step = 0
     global_eval_step = 0
-    print(f"[config] device={cfg.device}, model={cfg.model_id}")
+    print(f"[config] rollout_model_device={cfg.rollout_model_device}, policy_model_device={cfg.policy_model_device}, model={cfg.model_id}")
     print(
         f"[config] wandb={'on' if cfg.enable_wandb else 'off'}, "
         f"eager_vllm={'on' if cfg.use_eager_vllm else 'off'}"
@@ -164,7 +165,7 @@ def train(cfg: Config):
     load_prompt_template(cfg)
     rollout_loader, rollout_sampling_params = build_rollout(cfg)
     eval_loader = build_eval_loader(cfg)
-    policy, eval_model, tokenizer, optimizer, scheduler = init_models_and_optimizer(cfg)
+    policy_model, eval_model, tokenizer, optimizer, scheduler = init_models_and_optimizer(cfg)
 
     # Zero gradients at start
     optimizer.zero_grad()
@@ -172,7 +173,7 @@ def train(cfg: Config):
     data_iter = iter(rollout_loader)
 
     for grpo_step in range(cfg.n_grpo_steps):
-        load_policy_into_vllm_instance(policy, eval_model)
+        load_policy_into_vllm_instance(policy_model, eval_model)
 
         # Handle data iterator exhaustion
         try:
@@ -198,12 +199,12 @@ def train(cfg: Config):
         tokenized_dict = tokenize_prompt_and_output(
             flat_prompt_strs, flat_response_sts, tokenizer
         )
-        prompts = tokenized_dict["input_ids"].to(cfg.device)
-        responses = tokenized_dict["labels"].to(cfg.device)
-        response_mask = tokenized_dict["response_mask"].to(cfg.device)
+        prompts = tokenized_dict["input_ids"].to(cfg.rollout_model_device)
+        responses = tokenized_dict["labels"].to(cfg.rollout_model_device)
+        response_mask = tokenized_dict["response_mask"].to(cfg.rollout_model_device)
         with torch.no_grad():
             old_log_probs = compute_log_probs(
-                prompts, responses, policy, mem_optimize=True, chunk_size=32
+                prompts, responses, policy_model, mem_optimize=True, chunk_size=32
             )
             advantages, raw_rewards, group_rewards = compute_group_normalized_rewards(
                 reward_fn=r1_zero_reward_fn,
@@ -213,8 +214,8 @@ def train(cfg: Config):
                 advantage_eps=cfg.advantage_eps,
                 normalize_by_std=cfg.use_std_normalization,
             )
-            advantages = advantages.unsqueeze(-1).to(cfg.device)
-            raw_rewards = raw_rewards.unsqueeze(-1).to(cfg.device)
+            advantages = advantages.unsqueeze(-1).to(cfg.policy_model_device)
+            raw_rewards = raw_rewards.unsqueeze(-1).to(cfg.policy_model_device)
             raw_rewards_mean = raw_rewards.mean().item()
             raw_rewards_std = raw_rewards.std().item()
             advantages_mean = advantages.mean().item()
@@ -248,7 +249,7 @@ def train(cfg: Config):
 
                 if (mb_step + 1) % cfg.gradient_accumulation_steps == 0:
                     grad_norm = torch.nn.utils.clip_grad_norm_(
-                        policy.parameters(), max_norm=1
+                        policy_model.parameters(), max_norm=1
                     )
                     optimizer.step()
                     optimizer.zero_grad()
@@ -269,7 +270,7 @@ def train(cfg: Config):
                         }
                     )
                     # Eval after each update!
-                    load_policy_into_vllm_instance(policy, eval_model)
+                    load_policy_into_vllm_instance(policy_model, eval_model)
                     eval_res = run_eval(cfg, eval_model, eval_loader)
                     avg_format_reward = np.mean(
                         [x["score"]["format_reward"] for x in eval_res]
@@ -294,25 +295,6 @@ def train(cfg: Config):
                             "eval/answer_reward": avg_answer_reward,
                         }
                     )
-        if cfg.reset_vllm_cache_each_step and hasattr(eval_model, "llm_engine"):
-            try:
-                eval_model.llm_engine.cache_engine.reset()
-            except Exception as exc:  # noqa: BLE001
-                print(f"[warn] failed to reset vLLM cache: {exc}")
-
-        if cfg.empty_cuda_cache and torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        del (
-            prompts,
-            responses,
-            response_mask,
-            raw_rewards,
-            advantages,
-            old_log_probs,
-            flat_response_sts,
-            tokenized_dict,
-        )
 
 
 if __name__ == "__main__":

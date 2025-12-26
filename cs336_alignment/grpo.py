@@ -2,7 +2,7 @@ from typing import Callable, Literal
 
 import torch
 import torch.nn.functional as F
-from transformers import AutoModelForCausalLM
+from transformers import PreTrainedModel
 
 
 def compute_group_normalized_rewards(
@@ -188,7 +188,7 @@ def grpo_microbatch_train_step(
 def compute_log_probs(
     input_ids: torch.Tensor,
     labels: torch.Tensor,
-    model: AutoModelForCausalLM,
+    model: PreTrainedModel,
     mem_optimize: bool = False,
     chunk_size: int = 32,
 ) -> torch.Tensor:
