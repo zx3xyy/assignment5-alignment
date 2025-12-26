@@ -224,7 +224,7 @@ def run_masked_mean(
     """
     from cs336_alignment.grpo import masked_mean
 
-    return masked_compute_policy_gradient_lossmean(tensor, mask, dim)
+    return masked_mean(tensor, mask, dim)
 
 
 def run_sft_microbatch_train_step(
