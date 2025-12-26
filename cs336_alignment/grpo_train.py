@@ -1,4 +1,8 @@
-from dataclasses import dataclass
+import os
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
+
+from dataclasses import dataclass, asdict
 from typing import Literal, Tuple
 
 import numpy as np
@@ -49,7 +53,7 @@ class Config:
     model_id: str = "Qwen/Qwen2.5-Math-1.5B"
     rollout_model_device: str = "cuda:0"
     policy_model_device: str = "cuda:1"
-    gpu_memory_utilization: float = 0.09
+    gpu_memory_utilization: float = 0.85
     use_eager_vllm: bool = (
         False  # When True, skips CUDA graph capture to speed debugging
     )
@@ -80,7 +84,7 @@ class Config:
 def init_wandb(cfg: Config):
     wandb_log = lambda *_args, **_kwargs: None
     if cfg.enable_wandb:
-        wandb.init(project="math-sft", config=cfg)
+        wandb.init(project="math-sft", config=asdict(cfg))
         wandb.define_metric("train_step")
         wandb.define_metric("eval_step")
         wandb.define_metric("train/*", step_metric="train_step")
@@ -99,9 +103,9 @@ def build_rollout(cfg: Config) -> Tuple[DataLoader, SamplingParams]:
     rollout_dataset = load_dataset(cfg.dataset, "original", split="train")
 
     rollout_loader = torch.utils.data.DataLoader(
-        rollout_dataset,
+        rollout_dataset,  # type: ignore
         batch_size=cfg.n_prompts_per_rollout_batch,
-        shuffle=True,
+        shuffle=False,
         num_workers=0,
         pin_memory=False,
     )
@@ -120,7 +124,7 @@ def build_rollout(cfg: Config) -> Tuple[DataLoader, SamplingParams]:
 def build_eval_loader(cfg: Config) -> DataLoader:
     eval_dataset = load_dataset(cfg.dataset, "original", split="test")
     return torch.utils.data.DataLoader(
-        eval_dataset,
+        eval_dataset,  # type: ignore
         batch_size=cfg.eval_reader_local_batch_size,
         shuffle=False,  # Consistent eval across steps
     )
@@ -199,9 +203,10 @@ def train(cfg: Config):
         tokenized_dict = tokenize_prompt_and_output(
             flat_prompt_strs, flat_response_sts, tokenizer
         )
-        prompts = tokenized_dict["input_ids"].to(cfg.rollout_model_device)
-        responses = tokenized_dict["labels"].to(cfg.rollout_model_device)
-        response_mask = tokenized_dict["response_mask"].to(cfg.rollout_model_device)
+        # Move tensors to policy_model_device for compute_log_probs
+        prompts = tokenized_dict["input_ids"].to(cfg.policy_model_device)
+        responses = tokenized_dict["labels"].to(cfg.policy_model_device)
+        response_mask = tokenized_dict["response_mask"].to(cfg.policy_model_device)
         with torch.no_grad():
             old_log_probs = compute_log_probs(
                 prompts, responses, policy_model, mem_optimize=True, chunk_size=32
@@ -234,7 +239,7 @@ def train(cfg: Config):
                 mb_raw_rewards = raw_rewards[mb_idx]
                 mb_advantages = advantages[mb_idx]
                 mb_old_log_probs = old_log_probs[mb_idx]
-                policy_log_probs = compute_log_probs(mb_prompts, mb_responses, policy)
+                policy_log_probs = compute_log_probs(mb_prompts, mb_responses, policy_model)
 
                 loss, _ = grpo_microbatch_train_step(
                     policy_log_probs=policy_log_probs,

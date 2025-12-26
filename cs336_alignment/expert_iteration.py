@@ -75,9 +75,18 @@ def init_policy_model(
 
 
 def load_policy_into_vllm_instance(policy: PreTrainedModel, llm: LLM):
-    state_dict = policy.state_dict()
-    llm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
-    llm_model.load_weights(state_dict.items())
+    # Move state_dict to CPU to ensure it can be pickled and sent to vLLM workers
+    # This is necessary because vLLM might be running in a separate process (spawn)
+    state_dict = {k: v.cpu() for k, v in policy.state_dict().items()}
+    
+    def load_weights_func(model):
+        if hasattr(model, "load_weights"):
+            model.load_weights(state_dict.items())
+        else:
+            # Try to find the underlying model if it's wrapped
+            raise AttributeError(f"Model {type(model)} does not have load_weights method")
+
+    llm.apply_model(load_weights_func)
 
 
 def evaluate_vllm(
@@ -142,10 +151,22 @@ def collate_fn(batch):
     }
 
 
+class RolloutDataset(Dataset):
+    def __init__(self, hf_dataset):
+        self.hf_dataset = hf_dataset
+    
+    def __len__(self):
+        return len(self.hf_dataset)
+    
+    def __getitem__(self, idx):
+        return self.hf_dataset[idx]
+
+
 def get_train_dataloader(cfg, eval_model):
     rollout_dataset = load_dataset(cfg.eval_data, "original", split="train")
+    rollout_dataset_wrapped = RolloutDataset(rollout_dataset)
     rollout_loader = torch.utils.data.DataLoader(
-        rollout_dataset,
+        rollout_dataset_wrapped,
         batch_size=cfg.D_B,
         shuffle=False,
         num_workers=4,
@@ -272,8 +293,9 @@ def main(cfg):
     tokenizer = AutoTokenizer.from_pretrained(cfg.model_id)
 
     eval_dataset = load_dataset(cfg.eval_data, "original", split="test")
+    eval_dataset_wrapped = RolloutDataset(eval_dataset)
     eval_loader = torch.utils.data.DataLoader(
-        eval_dataset,
+        eval_dataset_wrapped,
         batch_size=cfg.eval_reader_local_batch_size,
         shuffle=True,
     )

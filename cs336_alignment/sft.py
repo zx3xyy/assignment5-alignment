@@ -101,20 +101,40 @@ def init_vllm(
 ):
     """
     Start the inference process, here we use vLLM to hold a model on a GPU separate from the policy.
+    
+    In vLLM 0.13.0+, GPU selection is controlled via CUDA_VISIBLE_DEVICES environment variable.
+    We temporarily set it during initialization and restore it afterwards to allow other models
+    (like the policy model in GRPO) to use different GPUs in the same process.
     """
+    import os
+    
     vllm_set_random_seed(seed)
+    os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
+    
+    # Save original CUDA_VISIBLE_DEVICES to restore later
+    original_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
+    
+    # Extract GPU id from device string (e.g., "cuda:0" -> "0")
+    if ":" in device:
+        gpu_id = device.split(":")[-1]
+        # Temporarily set environment variable to restrict vLLM to specific GPU
+        os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
 
     world_size_patch = patch("torch.distributed.get_world_size", return_value=1)
-    profiling_patch = patch(
-        "vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling",
-        return_value=None,
-    )
-    with world_size_patch, profiling_patch:
-        return LLM(
-            model=model_id,
-            device=device,
-            dtype=torch.bfloat16,
-            enable_prefix_caching=True,
-            gpu_memory_utilization=gpu_memory_utilization,
-            enforce_eager=enforce_eager,
-        )
+    # Note: profiling_patch removed for vLLM 0.13.0+ compatibility
+    # The _assert_memory_footprint_increased_during_profiling method no longer exists in newer vLLM versions
+    try:
+        with world_size_patch:
+            llm = LLM(
+                model=model_id,
+                dtype="bfloat16",
+                enable_prefix_caching=True,
+                gpu_memory_utilization=gpu_memory_utilization,
+                enforce_eager=enforce_eager,
+            )
+        return llm
+    finally:
+        if original_cuda_visible_devices is not None:
+            os.environ["CUDA_VISIBLE_DEVICES"] = original_cuda_visible_devices
+        elif ":" in device:
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
