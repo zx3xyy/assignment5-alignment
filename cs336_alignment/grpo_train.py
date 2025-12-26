@@ -2,6 +2,7 @@ import os
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
+import logging
 import tyro
 from dataclasses import dataclass, asdict
 from typing import Literal, Tuple, Optional
@@ -28,6 +29,7 @@ from cs336_alignment.grpo import (
 )
 from cs336_alignment.sft import tokenize_prompt_and_output
 from expert_iteration import init_policy_model, init_vllm
+from cs336_alignment.utils import setup_experiment
 
 
 @dataclass
@@ -94,7 +96,12 @@ class Config:
 def init_wandb(cfg: Config):
     wandb_log = lambda *_args, **_kwargs: None
     if cfg.enable_wandb:
-        wandb.init(project="math-sft", config=asdict(cfg))
+        wandb.init(
+            project="math-grpo", 
+            config=asdict(cfg),
+            name=cfg.exp_name,
+            group=cfg.wandb_group
+        )
         wandb.define_metric("train_step")
         wandb.define_metric("eval_step")
         wandb.define_metric("train/*", step_metric="train_step")
@@ -167,10 +174,13 @@ def init_models_and_optimizer(
 
 
 def train(cfg: Config):
+    setup_experiment(cfg)
+    logger = logging.getLogger(__name__)
+
     global_train_step = 0
     global_eval_step = 0
-    print(f"[config] rollout_model_device={cfg.rollout_model_device}, policy_model_device={cfg.policy_model_device}, model={cfg.model_id}")
-    print(
+    logger.info(f"[config] rollout_model_device={cfg.rollout_model_device}, policy_model_device={cfg.policy_model_device}, model={cfg.model_id}")
+    logger.info(
         f"[config] wandb={'on' if cfg.enable_wandb else 'off'}, "
         f"eager_vllm={'on' if cfg.use_eager_vllm else 'off'}"
     )
@@ -307,7 +317,7 @@ def train(cfg: Config):
                     avg_answer_reward = np.mean(
                         [x["score"]["answer_reward"] for x in eval_res]
                     )
-                    print(
+                    logging.info(
                         f"[train] step={global_train_step} "
                         f"loss={loss.item() * cfg.gradient_accumulation_steps:.4f} "
                         f"grad_norm={grad_norm.item():.2f} "
@@ -326,14 +336,15 @@ def train(cfg: Config):
                     )
 
     # Save model
-    print("Saving final model...")
-    save_path = "cs336_alignment/results/final_model"
+    logging.info("Saving final model...")
+    save_path = os.path.join(cfg.output_dir, cfg.exp_name)
+    os.makedirs(save_path, exist_ok=True)
     policy_model.save_pretrained(save_path)
     tokenizer.save_pretrained(save_path)
-    print(f"Model saved to {save_path}")
+    logging.info(f"Model saved to {save_path}")
 
     # Full evaluation
-    print("Running full evaluation on test set...")
+    logging.info("Running full evaluation on test set...")
     load_policy_into_vllm_instance(policy_model, eval_model)
     
     all_eval_res = []
@@ -359,7 +370,7 @@ def train(cfg: Config):
     avg_format_reward = np.mean([x["score"]["format_reward"] for x in all_eval_res])
     avg_answer_reward = np.mean([x["score"]["answer_reward"] for x in all_eval_res])
     
-    print(f"[Final Eval] Format Reward: {avg_format_reward:.4f}, Answer Reward: {avg_answer_reward:.4f}")
+    logging.info(f"[Final Eval] Format Reward: {avg_format_reward:.4f}, Answer Reward: {avg_answer_reward:.4f}")
     
     if cfg.enable_wandb:
         wandb_log({
@@ -369,4 +380,5 @@ def train(cfg: Config):
 
 
 if __name__ == "__main__":
-    train(Config())
+    cfg = tyro.cli(Config)
+    train(cfg)
