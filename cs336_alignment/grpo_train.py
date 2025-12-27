@@ -55,6 +55,7 @@ class Config:
     sampling_min_tokens: int = 4  # As in Expiter, disallow empty string responses
     sampling_max_tokens: int = 1024
     use_std_normalization: bool = True
+    use_masked_normalization: bool = False
 
     # Model / system configs
     model_id: str = "Qwen/Qwen2.5-Math-1.5B"
@@ -284,6 +285,7 @@ def train(cfg: Config):
                     advantages=mb_advantages,
                     old_log_probs=mb_old_log_probs,
                     cliprange=0.2,
+                    use_masked_normalization=cfg.use_masked_normalization,
                 )
 
                 if (mb_step + 1) % cfg.gradient_accumulation_steps == 0:

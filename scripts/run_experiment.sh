@@ -14,7 +14,11 @@ mkdir -p cs336_alignment/results
 echo "Starting experiment: $EXP_NAME"
 echo "Logs will be saved to: cs336_alignment/results/$EXP_NAME/train.log"
 
+# Ensure the directory exists
+mkdir -p "cs336_alignment/results/$EXP_NAME"
+
+# Run with stderr redirection to the log file
 python cs336_alignment/grpo_train.py \
     --exp-name "$EXP_NAME" \
-    "$@"
+    "$@" 2>> "cs336_alignment/results/$EXP_NAME/train.log"
 

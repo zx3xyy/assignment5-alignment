@@ -160,6 +160,22 @@ def masked_mean(
     """
     return torch.sum(tensor * mask, dim=dim) / torch.sum(mask, dim=dim)
 
+def masked_normalize(
+    tensor: torch.Tensor,
+    mask: torch.Tensor,
+    dim: int | None = None,
+    constant_normalizer: float = 1.0,
+) -> torch.Tensor:
+    """
+    Compute the normalized tensor along a given dimension, considering only those elements where mask == 1.
+    Args:
+        tensor: torch.Tensor The data to be normalized.
+        mask: torch.Tensor Same shape as tensor; positions with 1 are included in the normalization.
+        dim: int | None Dimension over which to normalize. If None, compute the normalization over all masked elements.
+        constant_normalizer: float A constant to scale the normalization factor.
+    Returns:  torch.Tensor The masked normalized tensor; shape matches tensor.mean(dim) semantics.
+    """
+    return torch.sum(tensor * mask, dim=dim) / constant_normalizer
 
 def grpo_microbatch_train_step(
     policy_log_probs: torch.Tensor,
@@ -170,6 +186,7 @@ def grpo_microbatch_train_step(
     advantages: torch.Tensor | None = None,
     old_log_probs: torch.Tensor | None = None,
     cliprange: float | None = None,
+    use_masked_normalization: bool = False,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """
     Specifically, given the raw rewards or advantages and log probs, we will compute the per-token loss, use masked_mean to aggregate to a scalar loss per example, average over the batch dimension, adjust for gradient accumulation, and backpropagate
@@ -178,9 +195,21 @@ def grpo_microbatch_train_step(
     per_token_loss, _ = compute_policy_gradient_loss(
         policy_log_probs, loss_type, raw_rewards, advantages, old_log_probs, cliprange
     )
-    loss = (
-        masked_mean(per_token_loss, response_mask, None) / gradient_accumulation_steps
-    )
+    max_generation_len = response_mask.sum(dim=1).max().item()
+    if use_masked_normalization:
+        # Normalize by max_len, batch_size, and gradient_accumulation_steps
+        batch_size = policy_log_probs.shape[0]
+        loss = masked_normalize(
+            per_token_loss,
+            response_mask,
+            None,
+            constant_normalizer=max_generation_len * batch_size * gradient_accumulation_steps,
+        )
+    else:
+        loss = (
+            masked_mean(per_token_loss, response_mask, None) / gradient_accumulation_steps
+        )
+
     loss.backward()
     return loss, {}
 

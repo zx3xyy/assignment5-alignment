@@ -13,6 +13,7 @@
   "sampling_min_tokens": 4,
   "sampling_max_tokens": 1024,
   "use_std_normalization": true,
+  "use_masked_normalization": true,
   "model_id": "Qwen/Qwen2.5-Math-1.5B",
   "rollout_model_device": "cuda:0",
   "policy_model_device": "cuda:1",

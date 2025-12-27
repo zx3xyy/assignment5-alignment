@@ -167,3 +167,10 @@ cython_debug/
 *wandb/
 uv.lock
 wandb/
+# Editor swap files
+*.swp
+*.swo
+
+# Experiment results
+cs336_alignment/results/*/
+!cs336_alignment/results/*.jsonl
