@@ -24,6 +24,8 @@ echo "Queueing experiments to tsp (Slots: $SLOTS)..."
 echo "Queueing: grpo_baseline"
 tsp ./scripts/run_experiment.sh grpo_baseline
 
+echo "Queueing: masked_normalization"
+tsp ./scripts/run_experiment.sh masked_normalization  --use_masked_normalization
 # ==========================================
 # 2. Learning Rate Ablations
 # ==========================================

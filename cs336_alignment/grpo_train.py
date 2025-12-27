@@ -1,4 +1,5 @@
 import os
+
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
@@ -38,7 +39,7 @@ class Config:
     # Optimization / GRPO hyperparameters
     n_grpo_steps: int = 200
     learning_rate: float = 1e-5
-    gradient_accumulation_steps: int = 64
+    gradient_accumulation_steps: int = 32
     loss_type: Literal[
         "no_baseline",
         "reinforce_with_baseline",
@@ -48,6 +49,7 @@ class Config:
     rollout_batch_size: int = 256
     epochs_per_rollout_batch: int = 1  # On-policy
     train_batch_size: int = 256  # On-policy
+    forward_chunk_size: int = 16  # For memory-efficient log prob computation
 
     # Sampling / reward shaping
     group_size: int = 8
@@ -56,7 +58,7 @@ class Config:
     sampling_max_tokens: int = 1024
     use_std_normalization: bool = True
     use_masked_normalization: bool = False
-    use_gradient_checkpointing: bool = True
+    use_gradient_checkpointing: bool = False
 
     # Model / system configs
     model_id: str = "Qwen/Qwen2.5-Math-1.5B"
@@ -99,10 +101,10 @@ def init_wandb(cfg: Config):
     wandb_log = lambda *_args, **_kwargs: None
     if cfg.enable_wandb:
         wandb.init(
-            project="math-grpo", 
+            project="math-grpo",
             config=asdict(cfg),
             name=cfg.exp_name,
-            group=cfg.wandb_group
+            group=cfg.wandb_group,
         )
         wandb.define_metric("train_step")
         wandb.define_metric("eval_step")
@@ -183,7 +185,9 @@ def train(cfg: Config):
 
     global_train_step = 0
     global_eval_step = 0
-    logger.info(f"[config] rollout_model_device={cfg.rollout_model_device}, policy_model_device={cfg.policy_model_device}, model={cfg.model_id}")
+    logger.info(
+        f"[config] rollout_model_device={cfg.rollout_model_device}, policy_model_device={cfg.policy_model_device}, model={cfg.model_id}"
+    )
     logger.info(
         f"[config] wandb={'on' if cfg.enable_wandb else 'off'}, "
         f"eager_vllm={'on' if cfg.use_eager_vllm else 'off'}"
@@ -193,7 +197,9 @@ def train(cfg: Config):
     load_prompt_template(cfg)
     rollout_loader, rollout_sampling_params = build_rollout(cfg)
     eval_loader = build_eval_loader(cfg)
-    policy_model, eval_model, tokenizer, optimizer, scheduler = init_models_and_optimizer(cfg)
+    policy_model, eval_model, tokenizer, optimizer, scheduler = (
+        init_models_and_optimizer(cfg)
+    )
 
     # Zero gradients at start
     optimizer.zero_grad()
@@ -233,7 +239,11 @@ def train(cfg: Config):
         response_mask = tokenized_dict["response_mask"].to(cfg.policy_model_device)
         with torch.no_grad():
             old_log_probs = compute_log_probs(
-                prompts, responses, policy_model, mem_optimize=True, chunk_size=32
+                prompts,
+                responses,
+                policy_model,
+                mem_optimize=True,
+                chunk_size=cfg.forward_chunk_size,
             )
             advantages, raw_rewards, group_rewards = compute_group_normalized_rewards(
                 reward_fn=r1_zero_reward_fn,
@@ -256,13 +266,22 @@ def train(cfg: Config):
                 table_data = []
                 # Log only the first group to avoid excessive data upload
                 for i in range(cfg.group_size):
-                    table_data.append([
-                        flat_prompt_strs[i],
-                        flat_response_sts[i],
-                        repeated_ground_truths[i],
-                        raw_rewards[i].item()
-                    ])
-                wandb_log({"rollout_examples": wandb.Table(columns=["Prompt", "Response", "Ground Truth", "Reward"], data=table_data)})
+                    table_data.append(
+                        [
+                            flat_prompt_strs[i],
+                            flat_response_sts[i],
+                            repeated_ground_truths[i],
+                            raw_rewards[i].item(),
+                        ]
+                    )
+                wandb_log(
+                    {
+                        "rollout_examples": wandb.Table(
+                            columns=["Prompt", "Response", "Ground Truth", "Reward"],
+                            data=table_data,
+                        )
+                    }
+                )
 
         for epoch in range(cfg.epochs_per_rollout_batch):
             for mb_step, mini_batch_start_idx in enumerate(
@@ -277,7 +296,13 @@ def train(cfg: Config):
                 mb_raw_rewards = raw_rewards[mb_idx]
                 mb_advantages = advantages[mb_idx]
                 mb_old_log_probs = old_log_probs[mb_idx]
-                policy_log_probs = compute_log_probs(mb_prompts, mb_responses, policy_model)
+                policy_log_probs = compute_log_probs(
+                    mb_prompts,
+                    mb_responses,
+                    policy_model,
+                    mem_optimize=True,
+                    chunk_size=cfg.forward_chunk_size,
+                )
 
                 loss, _ = grpo_microbatch_train_step(
                     policy_log_probs=policy_log_probs,
@@ -351,37 +376,42 @@ def train(cfg: Config):
     # Full evaluation
     logging.info("Running full evaluation on test set...")
     load_policy_into_vllm_instance(policy_model, eval_model)
-    
+
     all_eval_res = []
     # Re-create eval loader to ensure we iterate from start
     full_eval_loader = build_eval_loader(cfg)
-    
+
     from tqdm import tqdm
+
     for batch in tqdm(full_eval_loader, desc="Evaluating"):
         prompts = [
             cfg.prompt_template.format(question=problem) for problem in batch["problem"]
         ]
         extracted_solutions = [solution for solution in batch["extracted_solution"]]
-        
+
         batch_res = evaluate_vllm(
-            eval_model, 
-            r1_zero_reward_fn, 
-            prompts, 
-            extracted_solutions, 
-            cfg.sampling_params
+            eval_model,
+            r1_zero_reward_fn,
+            prompts,
+            extracted_solutions,
+            cfg.sampling_params,
         )
         all_eval_res.extend(batch_res)
 
     avg_format_reward = np.mean([x["score"]["format_reward"] for x in all_eval_res])
     avg_answer_reward = np.mean([x["score"]["answer_reward"] for x in all_eval_res])
-    
-    logging.info(f"[Final Eval] Format Reward: {avg_format_reward:.4f}, Answer Reward: {avg_answer_reward:.4f}")
-    
+
+    logging.info(
+        f"[Final Eval] Format Reward: {avg_format_reward:.4f}, Answer Reward: {avg_answer_reward:.4f}"
+    )
+
     if cfg.enable_wandb:
-        wandb_log({
-            "final_eval/format_reward": avg_format_reward,
-            "final_eval/answer_reward": avg_answer_reward,
-        })
+        wandb_log(
+            {
+                "final_eval/format_reward": avg_format_reward,
+                "final_eval/answer_reward": avg_answer_reward,
+            }
+        )
 
 
 if __name__ == "__main__":
