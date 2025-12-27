@@ -38,7 +38,7 @@ class Config:
     # Optimization / GRPO hyperparameters
     n_grpo_steps: int = 200
     learning_rate: float = 1e-5
-    gradient_accumulation_steps: int = 32  # microbatch size is 2, will fit on H100
+    gradient_accumulation_steps: int = 64
     loss_type: Literal[
         "no_baseline",
         "reinforce_with_baseline",
@@ -56,6 +56,7 @@ class Config:
     sampling_max_tokens: int = 1024
     use_std_normalization: bool = True
     use_masked_normalization: bool = False
+    use_gradient_checkpointing: bool = True
 
     # Model / system configs
     model_id: str = "Qwen/Qwen2.5-Math-1.5B"
@@ -159,6 +160,8 @@ def init_models_and_optimizer(
         enforce_eager=cfg.use_eager_vllm,
     )
     policy_model = init_policy_model(cfg.model_id, cfg.policy_model_device)
+    if cfg.use_gradient_checkpointing:
+        policy_model.gradient_checkpointing_enable()
     tokenizer = AutoTokenizer.from_pretrained(cfg.model_id)
     optimizer = torch.optim.AdamW(
         policy_model.parameters(),

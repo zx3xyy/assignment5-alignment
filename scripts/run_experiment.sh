@@ -1,6 +1,9 @@
 #!/bin/bash
 # Usage: ./scripts/run_experiment.sh [EXP_NAME] [EXTRA_ARGS...]
 
+killall python
+killall VLLM::EngineCore
+
 EXP_NAME=${1:-"grpo_baseline"}
 shift
 
