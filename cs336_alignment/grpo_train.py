@@ -89,6 +89,7 @@ class Config:
     exp_name: str = "grpo_baseline"
     wandb_group: Optional[str] = None
     output_dir: str = "cs336_alignment/results"
+    save_steps: int = 20
 
     def __post_init__(self):
         self.mini_batch_size = (
@@ -151,8 +152,56 @@ def build_eval_loader(cfg: Config) -> DataLoader:
     )
 
 
+def save_checkpoint(
+    cfg: Config,
+    policy_model: PreTrainedModel,
+    tokenizer: AutoTokenizer,
+    optimizer: torch.optim.Optimizer,
+    scheduler: CosineAnnealingLR,
+    grpo_step: int,
+    global_train_step: int,
+    global_eval_step: int,
+):
+    checkpoint_dir = os.path.join(cfg.output_dir, cfg.exp_name, "latest_checkpoint")
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
+    # Save model and tokenizer
+    policy_model.save_pretrained(checkpoint_dir)
+    tokenizer.save_pretrained(checkpoint_dir)
+
+    # Save training state
+    state = {
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "grpo_step": grpo_step,
+        "global_train_step": global_train_step,
+        "global_eval_step": global_eval_step,
+    }
+    torch.save(state, os.path.join(checkpoint_dir, "training_state.pt"))
+    logging.info(f"Saved checkpoint to {checkpoint_dir} at step {grpo_step}")
+
+
+def load_checkpoint_state(
+    cfg: Config,
+    optimizer: torch.optim.Optimizer,
+    scheduler: CosineAnnealingLR,
+) -> Tuple[int, int, int]:
+    checkpoint_dir = os.path.join(cfg.output_dir, cfg.exp_name, "latest_checkpoint")
+    state_path = os.path.join(checkpoint_dir, "training_state.pt")
+
+    if not os.path.exists(state_path):
+        return 0, 0, 0
+
+    logging.info(f"Loading training state from {state_path}")
+    state = torch.load(state_path)
+    optimizer.load_state_dict(state["optimizer"])
+    scheduler.load_state_dict(state["scheduler"])
+    return state["grpo_step"], state["global_train_step"], state.get("global_eval_step", 0)
+
+
 def init_models_and_optimizer(
     cfg: Config,
+    checkpoint_path: Optional[str] = None,
 ) -> Tuple[PreTrainedModel, LLM, AutoTokenizer, torch.optim.AdamW, CosineAnnealingLR]:
     eval_model = init_vllm(
         cfg.model_id,
@@ -161,7 +210,9 @@ def init_models_and_optimizer(
         gpu_memory_utilization=cfg.gpu_memory_utilization,
         enforce_eager=cfg.use_eager_vllm,
     )
-    policy_model = init_policy_model(cfg.model_id, cfg.policy_model_device)
+    policy_model_id = checkpoint_path if checkpoint_path else cfg.model_id
+    logging.info(f"Initializing policy model from {policy_model_id}")
+    policy_model = init_policy_model(policy_model_id, cfg.policy_model_device)
     if cfg.use_gradient_checkpointing:
         policy_model.gradient_checkpointing_enable()
     tokenizer = AutoTokenizer.from_pretrained(cfg.model_id)
@@ -183,8 +234,14 @@ def train(cfg: Config):
     setup_experiment(cfg)
     logger = logging.getLogger(__name__)
 
+    # Check for checkpoint
+    checkpoint_dir = os.path.join(cfg.output_dir, cfg.exp_name, "latest_checkpoint")
+    checkpoint_path = checkpoint_dir if os.path.exists(os.path.join(checkpoint_dir, "training_state.pt")) else None
+
     global_train_step = 0
     global_eval_step = 0
+    start_grpo_step = 0
+
     logger.info(
         f"[config] rollout_model_device={cfg.rollout_model_device}, policy_model_device={cfg.policy_model_device}, model={cfg.model_id}"
     )
@@ -198,15 +255,33 @@ def train(cfg: Config):
     rollout_loader, rollout_sampling_params = build_rollout(cfg)
     eval_loader = build_eval_loader(cfg)
     policy_model, eval_model, tokenizer, optimizer, scheduler = (
-        init_models_and_optimizer(cfg)
+        init_models_and_optimizer(cfg, checkpoint_path=checkpoint_path)
     )
+
+    if checkpoint_path:
+        start_grpo_step, global_train_step, global_eval_step = load_checkpoint_state(
+            cfg, optimizer, scheduler
+        )
+        # Since we saved at the END of the step, we should start from next step
+        start_grpo_step += 1
+        logging.info(f"Resuming from grpo_step {start_grpo_step}, global_train_step {global_train_step}")
 
     # Zero gradients at start
     optimizer.zero_grad()
 
     data_iter = iter(rollout_loader)
 
-    for grpo_step in range(cfg.n_grpo_steps):
+    # Fast forward data iterator
+    if start_grpo_step > 0:
+        logging.info(f"Fast-forwarding data iterator by {start_grpo_step} steps...")
+        for _ in range(start_grpo_step):
+            try:
+                next(data_iter)
+            except StopIteration:
+                data_iter = iter(rollout_loader)
+                next(data_iter)
+
+    for grpo_step in range(start_grpo_step, cfg.n_grpo_steps):
         load_policy_into_vllm_instance(policy_model, eval_model)
 
         # Handle data iterator exhaustion
@@ -274,14 +349,17 @@ def train(cfg: Config):
                             raw_rewards[i].item(),
                         ]
                     )
-                wandb_log(
-                    {
-                        "rollout_examples": wandb.Table(
-                            columns=["Prompt", "Response", "Ground Truth", "Reward"],
-                            data=table_data,
-                        )
-                    }
-                )
+                try:
+                    wandb_log(
+                        {
+                            "rollout_examples": wandb.Table(
+                                columns=["Prompt", "Response", "Ground Truth", "Reward"],
+                                data=table_data,
+                            )
+                        }
+                    )
+                except Exception as e:
+                    logging.warning(f"Failed to log rollout examples to wandb: {e}")
 
         for epoch in range(cfg.epochs_per_rollout_batch):
             for mb_step, mini_batch_start_idx in enumerate(
@@ -365,6 +443,18 @@ def train(cfg: Config):
                         }
                     )
 
+        if (grpo_step + 1) % cfg.save_steps == 0:
+            save_checkpoint(
+                cfg,
+                policy_model,
+                tokenizer,
+                optimizer,
+                scheduler,
+                grpo_step,
+                global_train_step,
+                global_eval_step,
+            )
+
     # Save model
     logging.info("Saving final model...")
     save_path = os.path.join(cfg.output_dir, cfg.exp_name)
@@ -416,4 +506,27 @@ def train(cfg: Config):
 
 if __name__ == "__main__":
     cfg = tyro.cli(Config)
-    train(cfg)
+    max_restarts = 1
+    restart_count = 0
+
+    while True:
+        try:
+            train(cfg)
+            break
+        except Exception as e:
+            if restart_count < max_restarts:
+                restart_count += 1
+                logging.error(f"Training failed with error: {e}. Restarting ({restart_count}/{max_restarts})...")
+                import traceback
+                traceback.print_exc()
+
+                # Try to clean up
+                import gc
+                gc.collect()
+                torch.cuda.empty_cache()
+
+                # We rely on train() to load the checkpoint
+                continue
+            else:
+                logging.error(f"Training failed with error: {e}. Max restarts reached.")
+                raise e

@@ -38,8 +38,8 @@ tsp ./scripts/run_experiment.sh grpo_lr_2e-5 --learning-rate 2e-5
 # ==========================================
 # 3. Loss Type Ablations
 # ==========================================
-echo "Queueing: grpo_clip_loss"
-tsp ./scripts/run_experiment.sh grpo_clip_loss --loss-type grpo_clip
+# echo "Queueing: grpo_clip_loss"
+# tsp ./scripts/run_experiment.sh grpo_clip_loss --loss-type grpo_clip
 
 echo "Queueing: grpo_no_baseline"
 tsp ./scripts/run_experiment.sh grpo_no_baseline --loss-type no_baseline

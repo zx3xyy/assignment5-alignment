@@ -172,5 +172,5 @@ wandb/
 *.swo
 
 # Experiment results
-cs336_alignment/results/*/
-!cs336_alignment/results/*.jsonl
+cs336_alignment/results
+# !cs336_alignment/results/*.jsonl
